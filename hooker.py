@@ -41,17 +41,18 @@ import signal
 import socket
 import struct
 import binascii
+from git import Repo
 from pathlib import Path
 from loguru import logger
-from git import Repo
 from datetime import datetime
 from collections import Counter
+from dataclasses import dataclass
+from androguard.core import androconf
 from androguard.core.bytecodes import apk
 from androguard.core.bytecodes import dvm
 from androguard.core.analysis.analysis import MethodAnalysis
-from androguard.core import androconf
 
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from adbutils.errors import AdbError
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
@@ -261,6 +262,7 @@ adb_device = None
 def _init_adb_device():
     global adb_device
     adb_device = adbutils.adb.device()
+
 _init_adb_device()
 
 def run_su_command(cmd, not_read=False):
@@ -278,6 +280,21 @@ def run_su_command(cmd, not_read=False):
         except Exception as e:
             pass
 
+
+def get_is_magisk_root() -> bool:
+    out = run_su_command("su -c id")
+    if "uid=0" not in out:
+        return False
+    # 有些设备不一定带 context 字段，但你这台带了，带了就几乎 100% 是 Magisk
+    if "context=u:r:magisk:s0" in out:
+        return True
+    # 没有 context 也可能是 root（或别的 su），再加个 Magisk 文件特征判断更保险
+    magisk_marker = run_su_command("ls /data/adb/magisk.db 2>/dev/null")
+    return bool(magisk_marker)
+
+is_magisk_root = get_is_magisk_root()
+
+
 #初始化frida运行环境
 def is_frida_working_via_attach(target_package="com.android.systemui"):
     try:
@@ -287,6 +304,7 @@ def is_frida_working_via_attach(target_package="com.android.systemui"):
         _session.detach()
         return True
     except frida.ServerNotRunningError:
+        #info("其他异常: ServerNotRunningError")
         return False
     except frida.ProcessNotFoundError:
         #info("⚠️ 找不到进程，说明包名可能错误，但 frida 正常")
@@ -295,7 +313,7 @@ def is_frida_working_via_attach(target_package="com.android.systemui"):
         #info("❌ 连接超时，frida-server 可能未运行或设备未连接")
         return False
     except Exception as e:
-        #print("其他异常:", e)
+        #info(f"其他异常: {e}")
         return False
 
 def check_remote_file_exists(path):
@@ -349,7 +367,8 @@ def push_file_to_remote(local_path, remote_path, is_debug=True):
         info(f"push {local_path} to {remote_path} successful")
     
 def is_root():
-    return "system" in run_su_command("ls /data/")
+    output = run_su_command("ls /data/")
+    return "cache" in output and "user" in output
 
 def ensure_root():
     if is_root():
@@ -361,7 +380,7 @@ def ensure_root():
                 info("Switched to root successfully ✅")
                 return True
             else:
-                info("❌ Failed to switch: device does not support root")
+                info("❌ Device is not rooted")
                 return False
         except Exception as e:
             info(f"❌ Failed to switch to root: {e}")
@@ -371,7 +390,10 @@ def ensure_root():
 # 自动化部署frida-server    
 if not is_frida_working_via_attach():
     if not ensure_root():
-        info("❌ Cannot auto-deploy frida-server. Please start frida-server manually and try again.")
+        info("❌ Cannot deploy frida-server automatically. Please start frida-server manually and try again.")
+        sys.exit(2)
+    elif is_magisk_root:
+        info("❌ Cannot deploy frida-server automatically on the Magisk devices. Please start frida-server manually and try again.")
         sys.exit(2)
     frida_server_file = choose_frida_server()
     remote_frida_server_file = f"/data/mobile-deploy/{frida_server_file}"
@@ -381,6 +403,7 @@ if not is_frida_working_via_attach():
         push_file_to_remote(f"mobile-deploy/{frida_server_file}", "/sdcard/")
         run_su_command(f"mv /sdcard/{frida_server_file} {remote_frida_server_file}")
         run_su_command(f"chmod +x {remote_frida_server_file}")
+    run_su_command("setenforce 0")
     run_su_command(f"cd /data/mobile-deploy/ && ./{choose_frida_server()} > /sdcard/f_server.log 2>&1 &", True)
     success = False
     for index in range(20):
@@ -405,6 +428,7 @@ current_local_apk_path = None
 current_identifier_cache_db = None
 current_identifier_cache_readonly_db = None
 current_identifier_stop_event = None
+webserver_url = None
 
 frida_device = None
 
@@ -503,6 +527,94 @@ def _init_frida_device():
 
 _init_frida_device()
 
+@dataclass
+class AppInfo:
+    name: str               # 应用名（label，拿不到时用包名代替）
+    identifier: str         # 包名
+    pid: Optional[int]      # 运行中才有 pid，否则 None
+
+def _list_third_party_packages() -> List[str]:
+    """
+    第三方包（-3）最稳定。
+    输出行形如：package:com.xxx.yyy
+    """
+    out = run_su_command("pm list packages -3")
+    pkgs = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("package:"):
+            pkgs.append(line.split("package:", 1)[1])
+    return pkgs
+
+
+def _get_pid_map() -> Dict[str, int]:
+    """
+    获取运行中进程的 pid 映射：package -> pid
+    优先 pidof（快），不行再回退 ps。
+    """
+    pid_map: Dict[str, int] = {}
+    # 方案 A：pidof（Android 8+ 大多支持）
+    # pidof 可能返回多个 pid（多进程），这里取第一个
+    # 但我们需要逐包调用 pidof，太慢，所以改用 ps 做一次性扫描更划算。
+    # 因此优先方案 B：ps -A 解析。
+    ps_out = run_su_command("ps -A -o PID,NAME")
+    # 输出示例：
+    # PID NAME
+    #  123 com.xxx.yyy
+    for line in ps_out.splitlines()[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r"\s+", line, maxsplit=1)
+        if len(parts) != 2:
+            continue
+        pid_s, name = parts
+        if name.startswith("com."):  # 简单过滤：只收集 app 进程
+            try:
+                pid_map[name] = int(pid_s)
+            except ValueError:
+                pass
+    return pid_map
+
+
+def _get_app_label_fast(pkg: str) -> Optional[str]:
+    """
+    尝试快速拿 label（不保证所有 ROM 都能拿到）。
+    方法：cmd package dump + grep
+    失败就返回 None（用包名代替）。
+    """
+    # 有些系统支持：cmd package resolve-activity / dumpsys package
+    # 但 label 不一定直接给；dumpsys package <pkg> 里通常能找到 "application-label:"
+    out = run_su_command(f"dumpsys package {pkg} | grep -m 1 -E 'application-label:'")
+    m = re.search(r"application-label:'(.*)'", out)
+    if m:
+        return m.group(1).strip()
+    return pkg
+
+
+def enumerate_applications_adbutils(third_party_only: bool = True, include_label: bool = False) -> List[AppInfo]:
+    """
+    用 adbutils 实现一个“类 enumerate_applications”的方法：
+    - identifier: 包名
+    - pid: 运行中的进程 pid（取主进程名 == 包名的情况）
+    - name: 可选，从 dumpsys 拿 label；默认用包名代替（快很多）
+    """
+    apps: List[AppInfo] = []
+    # pkgs = _list_third_party_packages()
+    # info(f"pkgs: {pkgs}")
+    # pid_map = _get_pid_map()
+    # info(f"is_magisk_root3:{is_magisk_root}")
+    # for pkg in pkgs:
+    #     pid = pid_map.get(pkg, 0)  # 只有“进程名==包名”的主进程才会命中
+    #     if include_label:
+    #         info(f"_get_app_label_fast:{pkg}")
+    #         label = _get_app_label_fast(pkg) or pkg
+    #     else:
+    #         label = pkg
+    #     apps.append(AppInfo(name=label, identifier=pkg, pid=pid))
+    # info(f"enumerate_applications_adbutils: {apps}")
+    return frida_device.enumerate_applications()
+
 def start_app(package_name):
     global current_identifier_pid
     shell_result = adb_device.shell(f"dumpsys package {package_name} | grep -A 1 MAIN | grep {package_name}").strip()
@@ -517,7 +629,7 @@ def start_app(package_name):
         time.sleep(0.5)
         if package_name in adb_device.shell("dumpsys activity activities | grep mResumedActivity"):
             break
-    apps = frida_device.enumerate_applications()
+    apps = enumerate_applications_adbutils(third_party_only=True, include_label=True)
     for app in sorted(apps, key=lambda x: x.pid or 0):
         if app.pid != 0 and app.identifier == package_name:
             current_identifier_pid = app.pid
@@ -533,9 +645,14 @@ def restart_app(package_name):
     current_identifier_pid = app_pid
 
 def ensure_app_in_foreground(package_name):
+    def get_main_pid(pkg):
+        out = adb_device.shell(f"pidof {pkg}").strip()
+        if out:
+            return int(out.split()[0])
+        return None
     uid = None
     shell_result = adb_device.shell(f"dumpsys package {package_name}").strip()
-    matchx = re.search(r"(userId|uid)=(\d+)", shell_result)
+    matchx = re.search(r"(userId|uid|appId)=(\d+)", shell_result)
     if matchx:
         uid = int(matchx.group(2))
     else:
@@ -558,7 +675,7 @@ def ensure_app_in_foreground(package_name):
         version_name = appinfo["version_name"]
     # 获取当前正在运行的所有进程
     proc_map = {}
-    apps = frida_device.enumerate_applications()
+    apps = enumerate_applications_adbutils(third_party_only=True, include_label=True)
     for app in sorted(apps, key=lambda x: x.pid or 0):
         if app.pid != 0:  # 只列出运行中的
             proc_map[app.identifier] = (app.pid, app.name)
@@ -574,11 +691,15 @@ def ensure_app_in_foreground(package_name):
             # 通过 am 启动主 Activity，会自动 bring 到前台
             adb_device.shell(f"monkey -p {package_name} -c android.intent.category.LAUNCHER 1")
             #print("proc_map[package_name][1]", proc_map[package_name][1])
-        return proc_map[package_name][0], proc_map[package_name][1], version_name, appinstall_path, appinstall_path_apkfilename, uid
+        main_pid = get_main_pid(package_name)
+        app_pid = main_pid if main_pid is not None else proc_map[package_name][0]
+        return app_pid, proc_map[package_name][1], version_name, appinstall_path, appinstall_path_apkfilename, uid
     else:
         info(f"🚀 App {package_name} is not running, starting it now...")
         #adb_device.shell(f"monkey -p {package_name} -c android.intent.category.LAUNCHER 1")
         app_pid, app_name = start_app(package_name)
+        main_pid = get_main_pid(package_name)
+        app_pid = main_pid if main_pid is not None else app_pid
         return app_pid, app_name, version_name, appinstall_path, appinstall_path_apkfilename, uid
 
 def get_remote_file_md5(file_path):
@@ -935,12 +1056,18 @@ def print_view(viewId):
         detach(online_session, online_script)
 
 def rpc_start_web_server(dex_file, all_class):
+    global webserver_url
     online_session = None
     online_script = None
     try:
         online_session, online_script = attach_rpc();
-        result = online_script.exports_sync.starthttpserver(dex_file, ",".join(all_class))
-        info(result)
+        text = online_script.exports_sync.starthttpserver(dex_file, ",".join(all_class))
+        info(text)
+        m = re.search("http:[^s]+:[\d]+", text)
+        if m:
+            webserver_url = m.group(0)
+        else:
+            info("找不到webserver" + text)
     except Exception:
         print(traceback.format_exc())
     finally:
@@ -1660,7 +1787,9 @@ def push_file_to_device_with_chmod(local_file, remote_file = None):
     info(f"push file OK {remote_file}")
     return remote_file
 
-def start_web_server(jar_file:str = None):
+def start_web_server(jar_file:str = "", with_xposed_daemon = False):
+    remote_dex_file = ""
+    all_classes = []
     if jar_file:
         dex_file = convert_jar_to_dex(jar_file)
         with open(f"{current_identifier}/{dex_file}", "rb") as f:
@@ -1677,13 +1806,13 @@ def start_web_server(jar_file:str = None):
         if len(all_classes) == 0:
             warn(f"Deploy failure. not found any class in {jar_file}")
             return
-        remote_file = push_file_to_device_with_chmod(dex_file)
-        rpc_start_web_server(remote_file, all_classes)
-    else:
-        rpc_start_web_server("", [])
+        remote_file = f"/data/user/0/{current_identifier}/hooker_server.dex"
+        remote_dex_file = push_file_to_device_with_chmod(dex_file, remote_file)
+    rpc_start_web_server(remote_dex_file, all_classes)
 
-def stop_web_server(port=8080):
-    result = adb_device.shell(f"curl --max-time 3 http://127.0.0.1:{port}/stop")
+def stop_web_server():
+    cmd = "curl --max-time 3 " + webserver_url + "/stop"
+    result = adb_device.shell(cmd)
     info(result)
 
 def tail_android_file(filepath: str):
@@ -2053,7 +2182,7 @@ def pad_display(text, width):
 
 def list_third_party_apps():
     identifier_list = []
-    apps = frida_device.enumerate_applications()
+    apps = enumerate_applications_adbutils(False, True)
     print(f"{pad_display('PID', 6)}\t{pad_display('APP', 20)}\t{pad_display('IDENTIFIER', 35)}\tEXIST_REVERSE_DIRECTORY")
     for app in sorted(apps, key=lambda x: x.pid or 0):
         if app.pid is not None:  # 只列出运行中的
@@ -2124,7 +2253,7 @@ while True:
         first_command_list.append("quit")
         first_command_list.append("upgrade")
         print("Please enter the identifier that needs to be reversed")
-        identifier = cmd_session.prompt('hooker(Identifier): ', completer=WordCompleter(first_command_list, ignore_case=False, match_middle=True, WORD=True)) 
+        identifier = cmd_session.prompt('hooker(Identifier): ', completer=WordCompleter(first_command_list, ignore_case=False, match_middle=True, WORD=True))
         identifier = identifier.strip()
         if identifier == 'exit' or identifier == 'exit()' or identifier == 'quit':
             info('ByeBye!')
